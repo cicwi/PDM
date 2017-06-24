@@ -32,25 +32,27 @@ class pdm(object):
     _wisdom_status = 1    
     '''
     def __init__(self):
-        self.max_evals = 100           # SETTING: maximum number of functions evaluations
-        self.display   = 'off'         # SETTING: output of fminsearch optimization {'iter', 'off', 'on'}
-        self.tau_fixed = None           	# SETTING: boolean vector to determine which values of tau_initial should not be estimated
-        self.rho_fixed = None			    # SETTING: boolean vector to determine which values of rho_initial should not be estimated
+        self.max_evals  = 100           # SETTING: maximum number of functions evaluations
+        self.display    = 'off'         # SETTING: output of fminsearch optimization {'iter', 'off', 'on'}
+        self.tau_fixed  = None           	# SETTING: boolean vector to determine which values of tau_initial should not be estimated
+        self.rho_fixed  = None			    # SETTING: boolean vector to determine which values of rho_initial should not be estimated
         self.rho_method = 'fminsearch'	# SETTING: how to optimize the grey levels {'fminsearch','quadratic'}
 
-        self.proj_geom		= []			# REQUIRED: tomography object
-        self.vol_geom= []
-        self.projections		= []			# REQUIRED: projections object, must match proj_geom of tomography
-
+        self.proj_geom	     = []			# REQUIRED: tomography object
+        self.vol_geom      = []
+        self.projections   = []			# REQUIRED: projections object, must match proj_geom of tomography
+        self.projector     = 'FP3D_CUDA'
+        
+        
         self.initialized		= False				# Is the object initialized?
 
         self.tau_initial = None
         self.rho_initial = None
 
-    def init_astra(self, volume, angles):
-        sz = self.projections.shape
-        self.proj_geom = astra.create_proj_geom('parallel', 1.0, sz[0], angles)
-        self.vol_geom = astra.create_vol_geom(volume.shape)
+    #def init_astra(self, volume, angles):
+    #    sz = self.projections.shape
+    #    self.proj_geom = astra.create_proj_geom('parallel', 1.0, sz[0], angles)
+    #    self.vol_geom = astra.create_vol_geom(volume.shape)
 
 
     #------------ Perform global thresholding PDM
@@ -90,11 +92,12 @@ class pdm(object):
         
         # Segmentation
         pm = self.create_partition_mask(volume, tau_opt)
-        s = numpy.zeros(pm.shape)
+        seg = numpy.zeros(pm.shape, dtype = numpy.float32)
+        
         for i in range(0,len(rho_opt)):
-            s[pm == i] = rho_opt[i]
+            seg[pm == i] = rho_opt[i]
 
-        return [s, rho_opt, tau_opt]
+        return [seg, rho_opt, tau_opt]
     
     
     #--------------- Initialize 
@@ -115,20 +118,24 @@ class pdm(object):
 
         # Create forward projection of each partition
         fp = []
-        
-        sino_id = astra.data2d.create('-sino', self.proj_geom)
-        cfg = astra.astra_dict('FP_CUDA')
+        proj = numpy.zeros(astra.functions.geom_size(self.proj_geom), dtype=numpy.float32)
+        sino_id = astra.data3d.link('-sino', self.proj_geom, proj)
+        cfg = astra.astra_dict(self.projector)
         cfg['ProjectionDataId'] = sino_id
         
-        for i in range(0, len(tau_all) + 1):
-            vol_id = astra.data2d.create('-vol', self.vol_geom, pm == i)
+        bin_vol = numpy.zeros(astra.functions.geom_size(self.vol_geom), dtype = numpy.bool)
+        vol_id = astra.data3d.link('-vol', self.vol_geom, bin_vol)
+        cfg['VolumeDataId'] = vol_id
+        alg_id = astra.algorithm.create(cfg)
             
-            cfg['VolumeDataId'] = vol_id
-            alg_id = astra.algorithm.create(cfg)
+        for i in range(0, len(tau_all) + 1):
+            bin_vol = pm == i            
             astra.algorithm.run(alg_id,1)
-            fp.append(astra.data2d.get(sino_id))
-            astra.algorithm.delete(alg_id)
-            astra.data2d.delete(vol_id)
+            fp.append(bin_vol)
+        
+        
+        astra.algorithm.delete(alg_id)
+        astra.data3d.delete([sino_id, vol_id])
 
         # Find rho
         if (self.rho_method == 'fminsearch'):
@@ -201,7 +208,7 @@ class pdm(object):
 
     #--------------- Create partition mask
     def create_partition_mask(self, volume, tau):
-        pm = numpy.zeros_like(volume)
+        pm = numpy.zeros_like(volume, dtype = numpy.uint8)
 
         for i in range(0,len(tau)):
             pm[volume > tau[i]] = i+1
